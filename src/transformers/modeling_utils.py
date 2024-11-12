@@ -129,6 +129,7 @@ if is_accelerate_available():
 
 if is_safetensors_available():
     from safetensors import safe_open
+    from safetensors.torch import load
     from safetensors.torch import load_file as safe_load_file
     from safetensors.torch import save_file as safe_save_file
 
@@ -561,7 +562,42 @@ def load_state_dict(
     """
     Reads a PyTorch checkpoint file, returning properly formatted errors if they arise.
     """
-    if checkpoint_file.endswith(".safetensors") and is_safetensors_available():
+    checkpoint_bytes = b""
+    if checkpoint_file.endswith(".znn"):
+        output_file = checkpoint_file.replace(".znn", "")
+        if not os.path.exists(output_file):
+            try:
+                from zipnn import ZipNN
+            except ImportError:
+                raise ImportError("To load a zipped checkpoint file, you need to install zipnn.")
+
+            znn = ZipNN(is_streaming=True)
+            with open(checkpoint_file, "rb") as infile:
+                chunk = infile.read()
+                checkpoint_bytes += znn.decompress(chunk)
+        else:
+            with open(output_file, "rb") as infile:
+                checkpoint_bytes += infile.read()
+
+    if checkpoint_file.endswith(".safetensors.znn") and is_safetensors_available() and checkpoint_bytes != b"":
+        try:
+            from struct import unpack
+        except ImportError:
+            raise ImportError("To load a zipped safetensors checkpoint file, you need to install struct.")
+
+        length_of_header = unpack("<Q", checkpoint_bytes[:8])[0]
+        header_data = checkpoint_bytes[8 : 8 + length_of_header]
+        header = json.loads(header_data)
+
+        # Check safetensors metadata
+        metadata = header.get("__metadata__", {})
+        if metadata.get("format") not in ["pt", "tf", "flax", "mlx"]:
+            raise OSError(
+                f"The safetensors archive passed at {checkpoint_file} does not contain the valid metadata. Make sure "
+                "you save your model with the `save_pretrained` method."
+            )
+        return load(checkpoint_bytes)
+    elif checkpoint_file.endswith(".safetensors") and is_safetensors_available():
         # Check format of the archive
         with safe_open(checkpoint_file, framework="pt") as f:
             metadata = f.metadata()
@@ -594,6 +630,12 @@ def load_state_dict(
         ):
             extra_args = {"mmap": True}
         weights_only_kwarg = {"weights_only": weights_only} if is_torch_greater_or_equal_than_1_13 else {}
+        if checkpoint_bytes:
+            try:
+                from io import BytesIO
+            except ImportError:
+                raise ImportError("To load a zipped checkpoint file, you need to install io.")
+            return torch.load(BytesIO(checkpoint_bytes), map_location=map_location, **weights_only_kwarg, **extra_args)
         return torch.load(
             checkpoint_file,
             map_location=map_location,
